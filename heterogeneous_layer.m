@@ -25,16 +25,16 @@
 % You should have received a copy of the GNU Lesser General Public License
 % along with k-Wave. If not, see <http://www.gnu.org/licenses/>. 
 
-clearvars; close all;
-
-% =========================================================================
+%% =========================================================================
 % SIMULATION
 % =========================================================================
 
+clearvars; close all;
+
 % 1) create the computational grid ----------------------------------------
-Nx = 1024;     % number of grid points in the x (row) direction
+Nx = 512;     % number of grid points in the x (row) direction
 Ny = Nx/2;     % number of grid points in the y (column) direction
-dx = 0.025e-3; % grid point spacing in the x direction [m]
+dx = 0.05e-3; % grid point spacing in the x direction [m]
 dy = dx;       % grid point spacing in the y direction [m]
 kgrid = kWaveGrid(Nx, dx, Ny, dy);
 
@@ -80,8 +80,8 @@ focus_pos     = [Nx/2, Ny/2];             % [grid points]
 source.p_mask = makeArc([Nx, Ny], arc_pos, radius, diameter, focus_pos);
 
 % 4) Create waveform ------------------------------------------------------
-sample_freq = 1/kgrid.dt;   % [Hz]
-signal_freq = 7.5e6; % [Hz]
+sample_freq = 1/kgrid.dt; % [Hz]
+signal_freq = 7.5e6;      % [Hz]
 num_cycles  = 3;
 source.p    = toneBurst(sample_freq, signal_freq, num_cycles, 'Plot', true);
 
@@ -108,43 +108,66 @@ sensor.mask = makeArc([Nx, Ny], arc_pos, radius, diameter, focus_pos);
 
 % assign the input options
 input_args = {'DisplayMask', source.p_mask, 'PMLInside', false, 'PlotPML', false};
-% input_args = {'DisplayMask', display_mask, 'PMLInside', false, 'PlotPML', false, 'RecordMovie', true, 'MovieArgs', {'FrameRate', 10}};
+% input_args = {'DisplayMask', source.p_mask, 'PMLInside', false, 'PlotPML', false, 'RecordMovie', true};
 
 % run the simulation
 sensor_data = kspaceFirstOrder2D(kgrid, medium, source, sensor, input_args{:});
 sensor_data = sum(sensor_data, 1);
 
-% =========================================================================
+%% ========================================================================
 % SIGNAL PROCESSING
 % =========================================================================
 
 % get a suitable scaling factor for the time axis
 [~, t_scale, t_prefix] = scaleSI(kgrid.t_array(end));
 
-USRaw_data    = sensor_data;
-USRaw_tvector = kgrid.t_array * t_scale;
+% 1) Prepare the necessary variables --------------------------------------
+USRaw_data       = sensor_data;
+USRaw_signalfreq = 1/kgrid.dt;  % [Hz]
+USRaw_samplefreq = kgrid.dt;    % [s]
+USRaw_tvector    = kgrid.t_array * t_scale; % [mus]
 
 USBurst_data       = source.p;
 USBurst_signalfreq = signal_freq; % [Hz]
 USBurst_samplefreq = sample_freq; % [Hz]
-USBurst_dt         = 1/USBurst_samplefreq;
-USBurst_tvector    = (0:length(USBurst_data) - 1) * USBurst_dt;
+USBurst_dt         = 1/USBurst_samplefreq; % [s]
+USBurst_tvector    = (0:length(USBurst_data) - 1) * (USBurst_dt* t_scale);
 
-% 1) correlate
-[S_corr, ~]  = xcorr(USRaw_data, USBurst_data);
+% 2) TGC ------------------------------------------------------------------
+
+tgc_mastergain  = 20;  % [dB]
+tgc_dacslope    = 1; % [dB/mus]
+tgc_dacdelay    = 2;   % [mus]
+tgc_maxgain     = 40;  % [dB]
+tgc_slopesample = tgc_dacslope * (USRaw_samplefreq * 1e6); % [dB/sample]
+
+idx       = knnsearch(USRaw_tvector', tgc_dacdelay, "K", 1);
+tgc_x1    = USRaw_tvector(1:idx);
+tgc_x2    = USRaw_tvector(idx+1:end);
+tgc_y1    = zeros(1, length(tgc_x1));
+tgc_y2    = ( tgc_slopesample * (1:length(tgc_x2)) );
+
+tgc_x = [tgc_x1, tgc_x2];
+tgc_y = [tgc_y1, tgc_y2] + tgc_mastergain;
+tgc_y(tgc_y>tgc_maxgain) = tgc_maxgain;
+
+USRaw_tgc = USRaw_data .* 10.^(tgc_y/10);
+
+% 3) Correlate ------------------------------------------------------------
+
+[S_corr, ~]  = xcorr(USRaw_tgc, USBurst_data);
 S_corr       = S_corr';
 % -- start from halfway of barkercode entering the US signal
 sample_start = length(S_corr) - ...
-               size(USRaw_data,2) - ...
+               size(USRaw_tgc,2) - ...
                floor( 0.5 * length(USBurst_data) ) +1;
 sample_end   = length(S_corr) - ...
                floor( 0.5 * length(USBurst_data) );
 USRaw_corr   = S_corr(sample_start:sample_end);
 
-% 2) Envelope
+% 4) Envelope and Peak ----------------------------------------------------
 S_envelop = envelope(USRaw_corr, 100, 'analytic');
 
-% 3) Peak
 offset = 200;
 [peaks, locs, width, prominence] =  findpeaks( S_envelop(offset+1:end), ...
                                               'MinPeakHeight', 0.5, ...
@@ -156,7 +179,7 @@ peaks    = peaks(1);
 % locs_t   = locs_idx*(USBurst_dt*1e6);
 locs_t   = locs_idx*(kgrid.dt*1e6);
 
-locs_mm  = (c1 * 1e3) * (locs_t*1e-6) / 2
+locs_mm  = (c1 * 1e3) * (locs_t*1e-6) / 2;
 
 % =========================================================================
 % VISUALISATION (2)
@@ -165,15 +188,20 @@ locs_mm  = (c1 * 1e3) * (locs_t*1e-6) / 2
 
 figure;
 subplot(2,1,1);
+yyaxis left;
 plot(USRaw_tvector, USRaw_data);
 xlabel('Time (us)');
 ylabel('Amplitude');
-grid on;
-axis tight;
+title('Raw and TGC');
+grid on; axis tight;
+yyaxis right;
+plot(USRaw_tvector, USRaw_tgc, '-g', 'LineWidth', 1);
+
 subplot(2,1,2);
 plot(USRaw_tvector, USRaw_corr);
 xlabel('Time (us)');
 ylabel('Amplitude');
+title('Correlated and Enveloped');
 grid on; axis tight; hold on;
 plot(USRaw_tvector, S_envelop, '-r', 'LineWidth', 1);
 plot(locs_t, peaks, 'or', 'MarkerFaceColor', 'r');
